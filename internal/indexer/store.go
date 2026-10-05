@@ -41,10 +41,10 @@ func validateBlock(b Block) error {
 
 // checkpoint 是持久化到磁盘的索引状态。
 type checkpoint struct {
-	TipHeight uint64            `json:"tipHeight"`
-	TipHash   string            `json:"tipHash"`
-	HasTip    bool              `json:"hasTip"`
-	Blocks    map[uint64]Block  `json:"blocks"`
+	TipHeight uint64               `json:"tipHeight"`
+	TipHash   string               `json:"tipHash"`
+	HasTip    bool                 `json:"hasTip"`
+	Blocks    map[uint64]Block     `json:"blocks"`
 	Txs       map[string]IndexedTx `json:"txs"`
 }
 
@@ -58,6 +58,51 @@ type Store struct {
 	tipHeight     uint64
 	tipHash       string
 	hasTip        bool
+	audit         *AuditTrail // 旁路留痕，可为 nil（独立使用 Store 时）
+}
+
+// SetAuditTrail 挂载重组旁路留痕。
+func (s *Store) SetAuditTrail(t *AuditTrail) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.audit = t
+}
+
+// Audit 返回挂载的留痕存储（未挂载时为 nil）。
+func (s *Store) Audit() *AuditTrail {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.audit
+}
+
+// storeSnapshot 是某一已提交时刻的索引只读快照，供巡检对账使用。
+// 快照在读锁内一次性拷贝，绝不包含写到一半的中间状态。
+type storeSnapshot struct {
+	hasTip    bool
+	tipHeight uint64
+	tipHash   string
+	blocks    map[uint64]Block
+	txs       map[string]IndexedTx
+}
+
+// Snapshot 返回当前已提交索引的一致性快照。
+func (s *Store) Snapshot() storeSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snap := storeSnapshot{
+		hasTip:    s.hasTip,
+		tipHeight: s.tipHeight,
+		tipHash:   s.tipHash,
+		blocks:    make(map[uint64]Block, len(s.blocksByHei)),
+		txs:       make(map[string]IndexedTx, len(s.txs)),
+	}
+	for h, b := range s.blocksByHei {
+		snap.blocks[h] = b
+	}
+	for h, t := range s.txs {
+		snap.txs[h] = t
+	}
+	return snap
 }
 
 // OpenStore 打开（必要时创建）位于 dir 的存储，并从检查点恢复进度。
@@ -165,8 +210,17 @@ func (s *Store) ApplyBlock(b Block) (applied bool, err error) {
 }
 
 // RollbackTo 回滚到指定高度（含），删除其上的所有区块与交易。
-// 返回被回滚的区块数。
+// 返回被回滚的区块数；该入口按“手动操作”处理，不产生重组留痕。
 func (s *Store) RollbackTo(height uint64) (int, error) {
+	return s.rollbackTo(height, "")
+}
+
+// rollbackWithReason 回滚并对被放弃区间写旁路留痕（reason 非空时）。
+func (s *Store) rollbackWithReason(height uint64, reason AbandonReason) (int, error) {
+	return s.rollbackTo(height, reason)
+}
+
+func (s *Store) rollbackTo(height uint64, reason AbandonReason) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.hasTip {
@@ -184,6 +238,16 @@ func (s *Store) RollbackTo(height uint64) (int, error) {
 			Reason: fmt.Sprintf("回滚目标高度 %d 不在索引中（链尖 %d）", height, s.tipHeight),
 		}
 	}
+	// 先收集被放弃区块（含父哈希与交易标识），用于旁路留痕。
+	var abandoned []AbandonedRecord
+	for h := s.tipHeight; h > height; h-- {
+		b := s.blocksByHei[h]
+		rec := AbandonedRecord{Height: b.Height, BlockHash: b.Hash, ParentHash: b.ParentHash}
+		for _, tx := range b.Txs {
+			rec.TxHashes = append(rec.TxHashes, tx.Hash)
+		}
+		abandoned = append(abandoned, rec)
+	}
 	reverted := 0
 	for h := s.tipHeight; h > height; h-- {
 		b := s.blocksByHei[h]
@@ -198,6 +262,14 @@ func (s *Store) RollbackTo(height uint64) (int, error) {
 	s.hasTip = height != 0
 	if err := s.persist(); err != nil {
 		return reverted, &Error{Kind: KindInternal, Height: height, Reason: "检查点持久化失败", Err: err}
+	}
+	// 留痕是旁路审计信息：失败不应破坏已提交的回滚结果，单独返回留痕错误。
+	if reason != "" && s.audit != nil && len(abandoned) > 0 {
+		// abandoned 按高度降序收集，追加时会再排序。
+		ev := AbandonedEvent{Reason: reason, Records: abandoned}
+		if err := s.audit.AppendEvent(ev); err != nil {
+			return reverted, &Error{Kind: KindInternal, Height: height, Reason: "重组留痕写入失败", Err: err}
+		}
 	}
 	return reverted, nil
 }

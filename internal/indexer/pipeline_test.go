@@ -51,7 +51,7 @@ func TestNormalProgression(t *testing.T) {
 	}
 	t.Logf("指标 applied=%d txs=%d 判定依据=10块×2交易", ix.Met.BlocksApplied.Load(), ix.Met.TxsApplied.Load())
 	if ix.Met.BlocksApplied.Load() != 10 || ix.Met.TxsApplied.Load() != 20 {
-		t.Fatalf("指标不符: %+v", ix.Met)
+		t.Fatalf("指标不符: applied=%d txs=%d dup=%d", ix.Met.BlocksApplied.Load(), ix.Met.TxsApplied.Load(), ix.Met.Duplicates.Load())
 	}
 }
 
@@ -79,7 +79,7 @@ func TestDuplicateIngestionIdempotent(t *testing.T) {
 	}
 	// 记录数不变：6 块、12 交易。
 	if ix.Met.BlocksApplied.Load() != 6 || ix.Met.TxsApplied.Load() != 12 {
-		t.Fatalf("重复摄入产生了新记录: %+v", ix.Met)
+		t.Fatalf("重复摄入产生了新记录: applied=%d txs=%d", ix.Met.BlocksApplied.Load(), ix.Met.TxsApplied.Load())
 	}
 	for _, tx := range b5.Txs {
 		if it, ok := ix.Store().TxByHash(tx.Hash); !ok || it.BlockHeight != 5 {
@@ -180,7 +180,7 @@ func TestConcurrentIngestion(t *testing.T) {
 		t.Fatalf("tip = %d, want 200", tipH)
 	}
 	if ix.Met.BlocksApplied.Load() != 200 || ix.Met.TxsApplied.Load() != 400 {
-		t.Fatalf("指标不符: %+v", ix.Met)
+		t.Fatalf("指标不符: applied=%d txs=%d dup=%d", ix.Met.BlocksApplied.Load(), ix.Met.TxsApplied.Load(), ix.Met.Duplicates.Load())
 	}
 	// 与串行结果逐块比对哈希。
 	serial := NewSimChain("concurrent", 200)

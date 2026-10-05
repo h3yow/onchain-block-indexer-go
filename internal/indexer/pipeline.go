@@ -10,11 +10,12 @@ import (
 
 // Config 是流水线配置。
 type Config struct {
-	StoreDir      string // 检查点持久化目录
-	MaxReorgDepth uint64 // 允许的最大重组深度，超过即拒绝
-	Workers       int    // 并发拉取协程数（<1 时按 1 处理）
-	PollBlocks    uint64 // 本次同步的目标高度上限（0 表示跟到数据源链尖）
-	MaxRetries    int    // 临时失败的最大重试次数（<1 时按 5 处理）
+	StoreDir      string      // 检查点持久化目录
+	MaxReorgDepth uint64      // 允许的最大重组深度，超过即拒绝
+	Workers       int         // 并发拉取协程数（<1 时按 1 处理）
+	PollBlocks    uint64      // 本次同步的目标高度上限（0 表示跟到数据源链尖）
+	MaxRetries    int         // 临时失败的最大重试次数（<1 时按 5 处理）
+	Audit         AuditPolicy // 重组旁路留痕的保留策略；零值表示启用留痕但永久保留
 }
 
 // Metrics 是关键运行指标（原子计数，可并发读取）。
@@ -37,8 +38,9 @@ type Indexer struct {
 	store *Store
 	Met   Metrics
 
-	mu   sync.Mutex // 序列化提交与重组
-	next uint64     // 下一个待摄入高度
+	mu      sync.Mutex   // 序列化提交与重组
+	stateMu sync.RWMutex // 多步变更（重组/自愈重建）写锁；巡检快照读锁
+	next    uint64       // 下一个待摄入高度
 }
 
 // NewIndexer 创建流水线并从持久化进度恢复（不重复不丢失）。
@@ -47,6 +49,11 @@ func NewIndexer(cfg Config, src Source) (*Indexer, error) {
 	if err != nil {
 		return nil, err
 	}
+	audit, err := OpenAuditTrail(cfg.StoreDir, cfg.Audit)
+	if err != nil {
+		return nil, err
+	}
+	st.SetAuditTrail(audit)
 	ix := &Indexer{cfg: cfg, src: src, store: st, next: 1}
 	if h, _, ok := st.Tip(); ok {
 		ix.next = h + 1
@@ -56,6 +63,9 @@ func NewIndexer(cfg Config, src Source) (*Indexer, error) {
 
 // Store 返回底层存储的查询入口。
 func (ix *Indexer) Store() *Store { return ix.store }
+
+// Audit 返回重组旁路留痕查询入口。
+func (ix *Indexer) Audit() *AuditTrail { return ix.store.Audit() }
 
 // Next 返回下一个待摄入高度。
 func (ix *Indexer) Next() uint64 {
@@ -159,6 +169,10 @@ func (ix *Indexer) commit(ctx context.Context, b Block) error {
 	conflict := hasTip && (b.Height <= tipH ||
 		(b.Height == tipH+1 && b.ParentHash != tipHash))
 	if conflict {
+		// 重组是“回滚+重建”的多步变更：持 stateMu 写锁，巡检与自愈
+		// 在这期间只能看到完整的回滚前或重建后状态。
+		ix.stateMu.Lock()
+		defer ix.stateMu.Unlock()
 		ancestor, err := ix.findCommonAncestor(ctx, b.Height-1)
 		if err != nil {
 			return err
@@ -171,7 +185,7 @@ func (ix *Indexer) commit(ctx context.Context, b Block) error {
 					depth, ix.cfg.MaxReorgDepth, ancestor),
 			}
 		}
-		reverted, err := ix.store.RollbackTo(ancestor)
+		reverted, err := ix.store.rollbackWithReason(ancestor, AbandonByReorg)
 		if err != nil {
 			return err
 		}
