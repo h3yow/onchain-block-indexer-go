@@ -10,11 +10,12 @@ import (
 
 // Config 是流水线配置。
 type Config struct {
-	StoreDir      string // 检查点持久化目录
-	MaxReorgDepth uint64 // 允许的最大重组深度，超过即拒绝
-	Workers       int    // 并发拉取协程数（<1 时按 1 处理）
-	PollBlocks    uint64 // 本次同步的目标高度上限（0 表示跟到数据源链尖）
-	MaxRetries    int    // 临时失败的最大重试次数（<1 时按 5 处理）
+	StoreDir      string      // 检查点持久化目录
+	MaxReorgDepth uint64      // 允许的最大重组深度，超过即拒绝
+	Workers       int         // 并发拉取协程数（<1 时按 1 处理）
+	PollBlocks    uint64      // 本次同步的目标高度上限（0 表示跟到数据源链尖）
+	MaxRetries    int         // 临时失败的最大重试次数（<1 时按 5 处理）
+	Audit         AuditConfig // 重组留痕（旁路审计）配置
 }
 
 // Metrics 是关键运行指标（原子计数，可并发读取）。
@@ -27,6 +28,10 @@ type Metrics struct {
 	TransientErrs  atomic.Uint64
 	FatalErrs      atomic.Uint64
 	InvalidBlocks  atomic.Uint64
+	// AuditRecords 为写入留痕的区块条数；AuditFailures 为留痕写入失败次数
+	// （留痕是旁路，失败不影响索引正确性，只计数暴露）。
+	AuditRecords  atomic.Uint64
+	AuditFailures atomic.Uint64
 }
 
 // Indexer 是索引流水线：并发拉取、按序提交、重组回滚。
@@ -35,9 +40,10 @@ type Indexer struct {
 	cfg   Config
 	src   Source
 	store *Store
+	audit *AuditLog
 	Met   Metrics
 
-	mu   sync.Mutex // 序列化提交与重组
+	mu   sync.Mutex // 序列化提交与重组；巡检后的自愈与修复也走这把锁
 	next uint64     // 下一个待摄入高度
 }
 
@@ -47,12 +53,19 @@ func NewIndexer(cfg Config, src Source) (*Indexer, error) {
 	if err != nil {
 		return nil, err
 	}
-	ix := &Indexer{cfg: cfg, src: src, store: st, next: 1}
+	al, err := OpenAuditLog(cfg.StoreDir, cfg.Audit)
+	if err != nil {
+		return nil, err
+	}
+	ix := &Indexer{cfg: cfg, src: src, store: st, audit: al, next: 1}
 	if h, _, ok := st.Tip(); ok {
 		ix.next = h + 1
 	}
 	return ix, nil
 }
+
+// Audit 返回重组留痕日志（未启用时为 nil，调用其方法是安全的空操作）。
+func (ix *Indexer) Audit() *AuditLog { return ix.audit }
 
 // Store 返回底层存储的查询入口。
 func (ix *Indexer) Store() *Store { return ix.store }
@@ -137,6 +150,35 @@ func (ix *Indexer) applyLocked(b Block) error {
 	return nil
 }
 
+// abandonBranchLocked 在持 ix.mu 状态下回滚到共同祖先 base，并把被放弃
+// 的旧分支区块（高度 (base, tip] 中存在的）记入旁路留痕。newTip 为重组
+// 完成后的新链尖高度（提交场景为当前块高度，修复场景为重建目标）。
+// 留痕写入失败不回滚索引、不阻断主流程，仅累计 AuditFailures。
+func (ix *Indexer) abandonBranchLocked(base, newTip uint64) (int, error) {
+	tipH, _, _ := ix.store.Tip()
+	var abandoned []Block
+	for h := tipH; h > base; h-- {
+		if b, ok := ix.store.BlockAt(h); ok {
+			abandoned = append(abandoned, b)
+		}
+	}
+	reverted, err := ix.store.RollbackTo(base)
+	if err != nil {
+		return 0, err
+	}
+	ix.Met.Reorgs.Add(1)
+	ix.Met.BlocksReverted.Add(uint64(reverted))
+	if len(abandoned) > 0 {
+		n, aerr := ix.audit.Append(abandoned, base, newTip)
+		if aerr != nil {
+			ix.Met.AuditFailures.Add(1)
+		} else {
+			ix.Met.AuditRecords.Add(uint64(n))
+		}
+	}
+	return reverted, nil
+}
+
 // commit 在 ix.mu 下提交一个区块，必要时执行重组：回滚到共同祖先并
 // 同步重建受影响区间，保证 Run 的按序提交窗口不受影响。
 func (ix *Indexer) commit(ctx context.Context, b Block) error {
@@ -171,12 +213,9 @@ func (ix *Indexer) commit(ctx context.Context, b Block) error {
 					depth, ix.cfg.MaxReorgDepth, ancestor),
 			}
 		}
-		reverted, err := ix.store.RollbackTo(ancestor)
-		if err != nil {
+		if _, err := ix.abandonBranchLocked(ancestor, b.Height); err != nil {
 			return err
 		}
-		ix.Met.Reorgs.Add(1)
-		ix.Met.BlocksReverted.Add(uint64(reverted))
 		// 同步重建 (ancestor, b.Height) 区间。
 		for h := ancestor + 1; h < b.Height; h++ {
 			nb, err := ix.fetchWithRetry(ctx, h)
